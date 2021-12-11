@@ -1,0 +1,356 @@
+---
+title: 'Project 2: Data Mining, Classification, Prediction'
+author: "SDS322E"
+date: ''
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  pdf_document:
+    toc: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, fig.align = "center", warning = F, message = F,
+tidy=TRUE, tidy.opts=list(width.cutoff=60), R.options=list(max.print=100))
+
+class_diag <- function(score, truth, positive, cutoff=.5){
+
+  pred <- factor(score>cutoff,levels=c("TRUE","FALSE"))
+  truth <- factor(truth==positive, levels=c("TRUE","FALSE"))
+
+  tab<-table(truth, pred)
+  acc=sum(diag(tab))/sum(tab)
+  sens=tab[1,1]/rowSums(tab)[1]
+  spec=tab[2,2]/rowSums(tab)[2]
+  ppv=tab[1,1]/colSums(tab)[1]
+
+#CALCULATE F1
+  f1=2*(sens*ppv)/(sens+ppv)
+  
+#CALCULATE EXACT AUC
+  truth<-as.numeric(truth=="TRUE")
+  ord<-order(score, decreasing=TRUE)
+  score <- score[ord]; truth <- truth[ord]
+  TPR=cumsum(truth)/max(1,sum(truth))
+  FPR=cumsum(!truth)/max(1,sum(!truth))
+  dup<-c(score[-1]>=score[-length(score)], FALSE)
+  TPR<-c(0,TPR[!dup],1); FPR<-c(0,FPR[!dup],1)
+  n <- length(TPR)
+  auc<- sum( ((TPR[-1]+TPR[-n])/2) * (FPR[-1]-FPR[-n]) )
+  round(data.frame(acc,sens,spec,ppv,f1,ba=(sens+spec)/2,auc, row.names = "Metrics"),4)
+}
+```
+
+# Mining, Classification, Prediction
+
+## Yejin Cho (yc27347)
+
+### Introduction 
+
+The dataset I chose for project2 is **music genre** dataset. This dataset is collected by a Kaggle user by using Spotify API and publicly available [online](https://www.kaggle.com/vicsuperman/prediction-of-music-genre). This dataset was appealing to me as I'm interested in music information retrieval. I was curious which features of a song could be helpful in predicting the genre of a song. A few things are modified from this original dataset: first, three variables are removed either because it seems less relevant to the genre classification task (`obtained_date`) or it came with no description of what it is (`liveness` and `speechness`). Also, `instrumentalness` variable (originally ranging from 0.0 to 1.0) has been converted into a binary variable by simply classifying the floating values into TRUE(>.5) or FALSE(<.5) with the threshold of 0.5.
+
+The full list of 15 variables we use here includes `id` (song id), `artist_name` (name of artist of the song), `track_name`(title of a song) , `popularity` (how popular a song is in Spotify), `acousticness` (how acoustic a song is), `danceability` (how suitable a track is for dancing), `duration_ms` (song duration in ms), `energy` (a perceptual measure of intensity; high if a song feels fast, loud, and noisy.), `instrumentalness` (the amount of instrumental sounds (non-vocals) in a song; TRUE if instrumental, FALSE if non-instrumental (vocal)), `key` (key of a song), `loudness` (how loud is a song), `mode` (major or minor), `tempo` (how fast is a song), `valence` (musical positiveness conveyed by a song), and `music_genre` (categorical variable that indicates genre of a song).
+
+To facilitate running the required tasks in this project, **100 samples from each of 15 genre** are randomly sampled from the original dataset of size 45k samples. As a result, we got **1500 observations** in total. The categorical variable we would like to predict is `music_genre` which consists of 10 different genres of music. These genres are `Alternative`, `Anime`, `Blues`, `Classical`, `Country`, `Electronic`, `Hip-Hop`, `Jazz`, `Rap`, and `Rock`. The frequency distribution of songs is uniform across different genre categories; as we have sampled 100 songs per genre, the mean number of songs per genre is 100 (with standard deviation of 0) and so are the minimum and maximum values. 
+
+
+```{R}
+library(tidyverse)
+library(dplyr)
+# read your datasets in here, e.g., with read_csv()
+df_raw = read_csv("music_genre.csv")
+
+# if your dataset needs tidying, do so here
+# remove all rows with NaN values
+df_raw %>% mutate_at(c("popularity", "acousticness", "danceability", "duration_ms", 
+                       "energy", "loudness", "tempo", "valence"), as.numeric) %>% na.omit() -> df_large
+
+# convert column with binary values to binary variable column
+df_large %>% mutate_at(c("instrumentalness"), as.logical) %>% na.omit() -> df_large
+
+# reduce the overall size of the dataset to make things faster
+df_large %>% group_by(music_genre) %>% sample_n(100) %>% ungroup() -> df
+
+# glimpse and summarize to see what it is like
+df %>% glimpse()
+df %>% group_by(music_genre) %>% summarize(cnt=n())
+df %>% group_by(music_genre) %>% summarize(cnt=n()) %>% 
+                summarize(mean=mean(cnt), std=sd(cnt), min=min(cnt), max=max(cnt))
+```
+
+### Cluster Analysis
+
+```{R}
+# clustering
+library(cluster)
+set.seed(322)
+clust_dat <- df %>% select(popularity, acousticness, danceability, energy) %>% as.data.frame
+# [NOTE] I've also tried scaling using 'scale' function, but that made the overall silhouette widths drop to .26. For that, I submit the better version of the code, which does not scale the four variables.
+clust_dat %>% pam(k=10) -> pam1
+
+# save cluster assignment as a column in your dataset
+pamclust <- clust_dat %>% mutate(cluster=as.factor(pam1$clustering))
+
+# make a plot of data colored by final cluster assignment
+pamclust %>% ggplot(aes(popularity, acousticness, color=cluster)) + geom_point()
+pamclust %>% ggplot(aes(danceability, energy, color=cluster)) + geom_point()
+
+# compute silhouette widths to find out the best k (that has the largest avg silhouette width)
+sil_width<-vector()
+for(i in 2:10){
+  pam_fit <- pam(clust_dat, k=i)
+  sil_width[i] <- pam_fit$silinfo$avg.width
+}
+
+# plot the silhouette widths from different k values
+ggplot()+geom_line(aes(x=1:10,y=sil_width))+scale_x_continuous(name="k",breaks=1:10) 
+# => k=2 has the largest avg silhouette width
+
+# computing and interpreting average silhouette width: 0.50
+pam1$silinfo$avg.width  # 0.26 <= x <= 0.50: "The structure is weak and could be artificial"
+plot(pam1, which=2)
+
+# re-do PAM clustering with optimal k value we found (k=2)
+clust_dat %>% pam(k=2) -> pam2
+pamclust2 <- clust_dat %>% mutate(cluster=as.factor(pam2$clustering))
+
+# Visualize the clusters by showing all pairwise combinations of variables colored by cluster assignment (using ggpairs)
+library(GGally)
+ggpairs(pamclust2, columns=1:4, aes(color=cluster))
+
+# goodness of fit with k=2: 0.5850
+pam2$silinfo$avg.width # 0.51 <= x <= 0.70: "A reasonable structure has been found"
+```
+
+We conducted PAM clustering on the given dataset and observed the following: (1) `popularity` is an important variable in explaining the clusters in the data (shown in the first figure), while others such as `acousticness`, `energy`, and `danceability` are not (shown in the first and second figure). (2) The best k value in PAM clustering is 2, according to the silhouette widths computed from 2 to 10. (3) The average silhouette width of PAM clustering on this data is 0.4976, meaning that 'the structure is weak and could be artificial' (0.26 <= x <= 0.50). (4) When we compare the PAM cluster configurations that use different pairwise combination of variables, we could see that `popularity` is the most salient feature in clustering the data points. (5) The goodness of fit with k=2 is 0.5850, meaning that 'a reasonable structure has been found' (0.51 <= x <= 0.70).
+
+    
+### Dimensionality Reduction with PCA
+
+```{R}
+# grab numerics and scale them 
+df_num <- df %>% select(-id) %>% select_if(is.numeric) %>% scale # use all 8 numeric variables (except `id`)
+
+# perform PCA using princomp(..., cor=T)
+music_pca <- princomp(df_num, cor=T)
+summary(music_pca, loadings=T)
+
+# visualize the observations’ PC scores for the PCs you retain (keep at least PC1 and PC2) in ggplot.
+
+# (1) the distribution of eight loadings in a barplot
+eigvals <- music_pca$sdev^2
+varprop <- eigvals/sum(eigvals)
+ggplot() + geom_bar(aes(y=varprop, x=1:8), stat="identity") + xlab("") + geom_path(aes(y=varprop, x=1:8)) + 
+  geom_text(aes(x=1:8, y=varprop, label=round(varprop, 2)), vjust=1, col="white", size=5) + 
+  scale_y_continuous(breaks=seq(0, .6, .2), labels = scales::percent) + 
+  scale_x_continuous(breaks=1:10)
+
+# (2) the observations’ PC scores for PC1 and PC2
+df %>% mutate(PC1=music_pca$scores[, 1], PC2=music_pca$scores[, 2]) %>%
+  ggplot(aes(PC1, PC2, color=music_genre)) + geom_point() + coord_fixed()
+
+# (3) plot of loadings in vector representation
+music_pca$loadings[1:8, 1:2] %>% as.data.frame %>% rownames_to_column %>%
+ggplot() + geom_hline(aes(yintercept=0), lty=2) +
+  geom_vline(aes(xintercept=0), lty=2) + ylab("PC2") + xlab("PC1") +
+  geom_segment(aes(x=0, y=0, xend=Comp.1, yend=Comp.2), arrow=arrow(), col="red") +
+  geom_label(aes(x=Comp.1*1.1, y=Comp.2*1.1, label=rowname))
+
+```
+
+In this section, we performed PCA as a way of dimensionality reduction of the data. As we can see in the distribution of the loadings (the first figure), the first PC accounts for 0.4 of the entire variance in the data, while it goes pretty low from the second (0.16) and forward (<0.12). Thus, when we use first two PCs (PC1 and PC2) to represent the reduced data as in the second figure, it is able to account for 0.56 of the original data. In this second figure, we can see that classical and country music (in green color) have low PC1 values, while hip-hop or electronic music (in blue shades) are mostly on the higher side of PC1 axis. This illustrates that PC1 is an informative measure that explains some of the notable differences between music of different genres.
+
+###  Linear Classifier
+
+```{R}
+# using a logistic regression, predict a binary variable from ALL of the rest of the numeric variables in your dataset.
+set.seed(322)
+library(dplyr)
+df %>% mutate_at(c('popularity', 'acousticness', 'danceability', 'duration_ms', 
+                    'energy', 'loudness', 'tempo', 'valence'), scale) %>% 
+       mutate_at(c('popularity', 'acousticness', 'danceability', 'duration_ms', 
+                    'energy', 'loudness', 'tempo', 'valence'), as.numeric) -> df_scaled
+
+df_scaled %>% mutate(is_classical=case_when(music_genre=="Classical" ~ TRUE,
+                                            music_genre!="Classical" ~ FALSE)) -> df_scaled
+
+# train the model to the entire dataset
+fit <- glm(is_classical ~ popularity + acousticness + danceability + duration_ms + 
+                          energy + loudness + tempo + valence, data=df_scaled, family="binomial")
+summary(fit)
+
+# get predictions for all observations
+score <- predict(fit, type="response")
+score %>% round(3) %>% head(n=100) # only show the first 100 predictions for brevity
+
+# run the `class_diag` function or equivalent to get in-sample performance and interpret, including a discussion of how well the model is doing per AUC. 
+class_diag(score, truth=df_scaled$is_classical, positive=1) # AUC score: 0.9705 (>0.9; great!)
+
+# report a confusion matrix (using a classification threshold of 0.5)
+y <- df_scaled$is_classical
+cutoff <- 0.5
+y_hat <- factor(score>cutoff, levels=c(TRUE, FALSE))
+table(actual = y, predicted = y_hat) %>% addmargins
+```
+
+Here, we have fitted a logistic regression model as a choice of linear classifier. When the model predicts the entire observations, it gives us 0.9705 AUC, meaning that its performance is great (>0.9).
+
+
+```{R}
+# K-fold cross-validation of logistic regression classifier
+set.seed(322)
+
+k=10
+data <- df_scaled[sample(nrow(df_scaled)),] # randomly order rows
+folds <- cut(seq(1:nrow(df_scaled)), breaks=k, labels=F) # create k different folds
+diags <- NULL
+
+for(i in 1:k){
+  ## Create training and test sets
+  train <- data[folds!=i,]
+  test <- data[folds==i,]
+  truth <- test$is_classical # Truth labels for fold i
+  
+  ## Train model on training set (all but fold i)
+  fit <- glm(is_classical ~ popularity + acousticness + danceability + duration_ms + 
+                            energy + loudness + tempo + valence, data=train, family="binomial")
+
+  ## Test model on test set (fold i)
+  probs <- predict(fit, newdata = test, type="response")
+  
+  ## Get diagnostics for fold i (i.e., run the class_diag function to get out-of-sample performance averaged across your k folds)
+  diags <- rbind(diags, class_diag(probs, truth, positive=1))
+}
+
+# average diagnostics across all k folds
+summarize_all(diags, mean) # AUC score: 0.9614
+
+```
+When we do a k-fold cross validation on this model, we observe a slightly lower AUC (0.9614) than before. This means that the model is not likely to have overfitted to the dataset. As this is an averaged estimate of the ten AUC values we got from k (k=10) different trains and tests, we can say that this is a more reliable statistic than what we computed earlier.
+
+### Non-Parametric Classifier
+
+```{R}
+# Non-parametric classifier: k-nearest-neighbors
+set.seed(322)
+
+# Train the model to the entire dataset and then use it to get predictions for all observations. 
+library(caret)
+knn_fit <- knn3(factor(is_classical==1,levels=c("TRUE","FALSE")) ~ 
+                  popularity + acousticness + danceability + duration_ms + 
+                  energy + loudness + tempo + valence, data=df_scaled, k=5)
+
+y_hat_knn <- predict(knn_fit, df_scaled)
+
+# Run the class_diag function or equivalent to get in-sample performance and interpret, including a discussion of how well the model is doing per AUC.
+class_diag(y_hat_knn[,1], df_scaled$is_classical, positive=1) # AUC score: 0.9902 (>0.9; great!)
+
+# Report a confusion matrix (using a classification threshold of 0.5)
+y <- df_scaled$is_classical
+cutoff <- 0.5
+y_hat <- factor(y_hat_knn[,1]>cutoff, levels=c(TRUE, FALSE))
+table(actual = y, predicted = y_hat) %>% addmargins
+```
+
+```{R}
+# Cross-validation of np classifier (k-nearest-neighbors)
+set.seed(322)
+
+k=10 # number of folds
+data <- df_scaled[sample(nrow(df_scaled)),] # randomly order rows
+folds <- cut(seq(1:nrow(df_scaled)), breaks=k, labels=F) # create k folds
+diags <- NULL
+
+for(i in 1:k){
+  # Create training and test sets
+  train <- data[folds!=i,]
+  test <- data[folds==i,]
+  truth <- test$is_classical # Truth labels for fold i
+  # Train model on training set (all but fold i)
+  fit <- knn3(is_classical ~ popularity + acousticness + danceability + duration_ms + 
+                            energy + loudness + tempo + valence, data=train)
+  # Test model on test set (fold i)
+  probs <- predict(fit, newdata = test)[,2]
+  # Get diagnostics for fold i
+  diags <- rbind(diags,class_diag(probs, truth, positive=1))
+}
+
+# Get out-of-sample performance averaged across your k folds.
+summarize_all(diags, mean) # AUC score: 0.92376 (>0.9; lower than before but still great!)
+```
+
+As a non-parametric classifier, we chose k-nearest-neighbors model. The model predicting new observations again does a great job per the CV (cross-validated) AUC (0.92376). The extremely high AUC score on the entire dataset (0.9902) suggests that it is overfitting. In comparison, our linear model showed more stable results than our non-parametric model in its cross-validation performances.
+
+### Regression/Numeric Prediction
+
+```{R}
+set.seed(322)
+
+# Fit a linear regression model to your entire dataset, predicting one of your numeric variables from at least 2 other variables
+fit <- lm(popularity ~ danceability + valence, data=df_scaled) # predict popularity from all other variables
+
+# Report the MSE for the overall dataset
+yhat<-predict(fit) # predicted popularity
+mean((df_scaled$popularity-yhat)^2) # mean squared error (MSE): 0.8723913
+```
+
+```{R}
+# cross-validation of regression model
+set.seed(322)
+
+# Perform k-fold CV on this same model (fine to use caret). Calculate the average MSE across your k testing folds.
+k=5 # choose number of folds
+data <- df_scaled[sample(nrow(df_scaled)),] # randomly order rows
+folds <- cut(seq(1:nrow(df_scaled)),breaks=k,labels=F) # create folds
+diags <- NULL
+for(i in 1:k){
+  train<-data[folds!=i,]
+  test<-data[folds==i,]
+  # Fit linear regression model to training set
+  fit<-lm(popularity ~ danceability + valence, data=train)
+  # Get predictions/y-hats on test set (fold i)
+  yhat<-predict(fit, newdata=test)
+  # Compute prediction error  (MSE) for fold i
+  diags<-rbind(diags,mean((test$popularity-yhat)^2))
+}
+mean(diags) # get average MSE across all folds: 0.8762793
+```
+
+Here, we fit a linear regression model to predict the popularity of a song from two variables: danceability and valence. The cross-validated test MSE of this model is 0.87, which is pretty decent but not great. As the MSE on the entire dataset and the CV MSE do not differ by much, we can say that we don't see any signs of overfitting here.
+
+### Python 
+
+```{R}
+# R code here
+# Using reticulate, demonstrate how you can share objects between R and python using r. and py$
+library(reticulate)
+use_python("/usr/bin/python3", required = F)
+num_r <-100
+```
+
+In this R codeblock above, we have called python shell by `use_python` command and declared a numeric variable `num_r` (=100) in R workspace.
+
+```{python}
+# python code here
+num_python = 456
+print(r.num_r, num_python) #access R-defined objects with r.
+```
+
+This time, we opened a python codeblock and declared a numeric variable `num_python` (=456) in python workspace. After that, we were able to print `num_r` variable from R workspace we defined before by using `r.`, along with `num_python` in python workspace. This means it is possible to share the variables in these two different workspaces (in R and python).
+
+```{R}
+# R code here
+cat(c(num_r,py$num_python)) #access Python-defined objects with py$
+```
+
+It is also possible to call out a variable from the python workspace in R by using `py$`. The code above also prints out the two numeric variables of different workspaces together, showing that the opposite also works.
+
+### Concluding Remarks
+
+Thank you for the semester! I got to like R better than before thanks to this course. :)
+
+
+
